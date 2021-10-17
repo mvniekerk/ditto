@@ -34,8 +34,8 @@ import static org.eclipse.ditto.connectivity.api.placeholders.ConnectivityPlaceh
 @Immutable
 public final class NatsValidator extends AbstractProtocolValidator {
 
-    private static final Collection<String> ACCEPTED_SCHEMES = List.of("nats");
-    private static final Collection<String> SECURE_SCHEMES = List.of("nats");
+    private static final Collection<String> ACCEPTED_SCHEMES = List.of("nats", "opentls", "tls");
+    private static final Collection<String> SECURE_SCHEMES = List.of("opentls", "tls");
 
     /**
      * Creates a new instance
@@ -72,7 +72,7 @@ public final class NatsValidator extends AbstractProtocolValidator {
     @Override
     public void validate(final Connection connection, final DittoHeaders dittoHeaders, final ActorSystem actorSystem,
                          final ConnectivityConfig connectivityConfig) {
-        validateUriScheme(connection, dittoHeaders, ACCEPTED_SCHEMES, SECURE_SCHEMES, "AMQP 0.9.1");
+        validateUriScheme(connection, dittoHeaders, ACCEPTED_SCHEMES, SECURE_SCHEMES, "NATS");
         validateSourceConfigs(connection, dittoHeaders);
         validateTargetConfigs(connection, dittoHeaders);
         validatePayloadMappings(connection, actorSystem, connectivityConfig, dittoHeaders);

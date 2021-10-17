@@ -16,6 +16,7 @@ import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
 
 import javax.annotation.concurrent.Immutable;
 import java.util.List;
+import static io.nats.client.Options.*;
 
 /**
  * Provides the configuration to connect to a Nats.io instance or cluster
@@ -30,7 +31,34 @@ public interface NatsConfig {
      * {@code NatsConfig}.
      */
     enum NatsConfigValue implements KnownConfigValue {
-        SERVERS("servers", List.of("nats://localhost:4222"));
+        SERVERS("servers", List.of(DEFAULT_URL)),
+        NO_RANDOMIZE("no-randomize", false),
+        CONNECTION_NAME("connection-name", ""),
+        VERBOSE("verbose", false),
+        PEDANTIC("pedantic", false),
+        MAX_CONTROL_LINE("max-control-line", DEFAULT_MAX_CONTROL_LINE),
+        MAX_RECONNECT("max-reconnect", DEFAULT_MAX_RECONNECT),
+        RECONNECT_WAIT("reconnect-wait", DEFAULT_RECONNECT_WAIT),
+        RECONNECT_JITTER("reconnect-jitter", DEFAULT_RECONNECT_JITTER),
+        RECONNECT_JITTER_TLS("reconnect-jitter-tls", DEFAULT_RECONNECT_JITTER_TLS),
+        CONNECTION_TIMEOUT("connection-timeout", DEFAULT_CONNECTION_TIMEOUT),
+        PING_INTERVAL("ping-interval", DEFAULT_PING_INTERVAL),
+        REQUEST_CLEANUP_INTERVAL("request-cleanup-interval", DEFAULT_REQUEST_CLEANUP_INTERVAL),
+        MAX_PINGS_OUT("max-pings-out", DEFAULT_MAX_PINGS_OUT),
+        RECONNECT_BUFFER_SIZE("reconnect-buffer-size", DEFAULT_RECONNECT_BUF_SIZE),
+        USE_OLD_REQUEST_STYLE("use-old-request-style", false),
+        BUFFER_SIZE("buffer-size", DEFAULT_BUFFER_SIZE),
+        TRACK_ADVANCED_STATS("track-advanced-stats", false),
+        TRACE_CONNECTION("trace-connection", false),
+        NO_ECHO("no-echo", false),
+        NO_HEADERS("no-headers", false),
+        NO_NO_RESPONDERS("no-no-responders", false),
+        UTF8_SUPPORT("utf8-support", false),
+        INBOX_PREFIX("inbox-prefix", DEFAULT_INBOX_PREFIX),
+        MAX_MESSAGES_IN_OUTGOING_QUEUE("max-messages-in-outgoing-queue", DEFAULT_MAX_MESSAGES_IN_OUTGOING_QUEUE),
+        DISCARD_MESSAGES_WHEN_OUTGOING_QUEUE_FULL("discard-messages-when-outgoing-queue-full", DEFAULT_DISCARD_MESSAGES_WHEN_OUTGOING_QUEUE_FULL);
+
+
         private final String path;
         private final Object defaultValue;
 
