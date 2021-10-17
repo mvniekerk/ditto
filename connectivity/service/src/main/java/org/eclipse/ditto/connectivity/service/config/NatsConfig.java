@@ -15,6 +15,7 @@ package org.eclipse.ditto.connectivity.service.config;
 import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
 
 import javax.annotation.concurrent.Immutable;
+import java.util.List;
 
 /**
  * Provides the configuration to connect to a Nats.io instance or cluster
@@ -22,12 +23,14 @@ import javax.annotation.concurrent.Immutable;
 @Immutable
 public interface NatsConfig {
 
+    List<String> servers();
+
     /**
      * An enumeration of the known config path expressions and their associated default values for
      * {@code NatsConfig}.
      */
     enum NatsConfigValue implements KnownConfigValue {
-        SERVERS("servers", "nats://localhost:4222");
+        SERVERS("servers", List.of("nats://localhost:4222"));
         private final String path;
         private final Object defaultValue;
 

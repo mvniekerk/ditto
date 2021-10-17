@@ -88,6 +88,7 @@ import org.eclipse.ditto.connectivity.service.messaging.monitoring.metrics.Retri
 import org.eclipse.ditto.connectivity.service.messaging.monitoring.metrics.RetrieveConnectionStatusAggregatorActor;
 import org.eclipse.ditto.connectivity.service.messaging.mqtt.Mqtt3Validator;
 import org.eclipse.ditto.connectivity.service.messaging.mqtt.Mqtt5Validator;
+import org.eclipse.ditto.connectivity.service.messaging.nats.NatsValidator;
 import org.eclipse.ditto.connectivity.service.messaging.persistence.stages.ConnectionAction;
 import org.eclipse.ditto.connectivity.service.messaging.persistence.stages.ConnectionState;
 import org.eclipse.ditto.connectivity.service.messaging.persistence.stages.StagedCommand;
@@ -1116,6 +1117,7 @@ public final class ConnectionPersistenceActor
                         AmqpValidator.newInstance(),
                         Mqtt3Validator.newInstance(mqttConfig),
                         Mqtt5Validator.newInstance(mqttConfig),
+                        NatsValidator.newInstance(),
                         KafkaValidator.getInstance(),
                         HttpPushValidator.newInstance());
 

@@ -119,6 +119,13 @@ public interface ConnectionConfig extends WithSupervisorConfig, WithActivityChec
     MqttConfig getMqttConfig();
 
     /**
+     * Returns the config specific to the MQTT protocol.
+     *
+     * @return the config.
+     */
+    NatsConfig getNatsConfig();
+
+    /**
      * Returns the Kafka configuration settings.
      *
      * @return the config.
