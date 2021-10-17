@@ -15,12 +15,6 @@ package org.eclipse.ditto.connectivity.service.messaging.nats;
 import akka.actor.ActorRef;
 import akka.actor.Props;
 import akka.japi.pf.ReceiveBuilder;
-import com.newmotion.akka.rabbitmq.ChannelCreated;
-import com.newmotion.akka.rabbitmq.ChannelMessage;
-//import com.rabbitmq.client.AMQP;
-//import com.rabbitmq.client.Channel;
-//import com.rabbitmq.client.ConfirmListener;
-//import com.rabbitmq.client.ReturnListener;
 import com.typesafe.config.Config;
 import org.eclipse.ditto.base.model.common.CharsetDeterminer;
 import org.eclipse.ditto.base.model.common.HttpStatus;
@@ -32,6 +26,7 @@ import org.eclipse.ditto.base.model.signals.acks.Acknowledgement;
 import org.eclipse.ditto.connectivity.api.ExternalMessage;
 import org.eclipse.ditto.connectivity.model.*;
 import org.eclipse.ditto.connectivity.service.config.DittoConnectivityConfig;
+import org.eclipse.ditto.connectivity.service.config.NatsConfig;
 import org.eclipse.ditto.connectivity.service.messaging.BasePublisherActor;
 import org.eclipse.ditto.connectivity.service.messaging.ConnectivityStatusResolver;
 import org.eclipse.ditto.connectivity.service.messaging.SendResult;
@@ -47,7 +42,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongConsumer;
 import java.util.stream.Collectors;
@@ -55,7 +49,7 @@ import java.util.stream.Collectors;
 import static org.eclipse.ditto.connectivity.service.messaging.validation.ConnectionValidator.resolveConnectionIdPlaceholder;
 
 /**
- * Responsible for publishing {@link ExternalMessage}s into RabbitMQ / AMQP 0.9.1.
+ * Responsible for publishing {@link ExternalMessage}s into Nats
  * <p>
  * To receive responses the {@code replyTo} header must be set. Responses are sent to the default exchange with the
  * {@code replyTo} header as routing key.
@@ -72,18 +66,13 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
     /**
      * The name of this Actor in the ActorSystem.
      */
-    static final String ACTOR_NAME = "rmqPublisherActor";
-
-    /**
-     * Lifetime of an entry in the cache 'outstandingAcks'.
-     */
-    private final Duration pendingAckTTL;
+    static final String ACTOR_NAME = "natsPublisherActor";
 
     private final ConcurrentSkipListMap<Long, OutstandingResponse> outstandingAcks = new ConcurrentSkipListMap<>();
     private final ConcurrentHashMap<NatsTarget, Queue<OutstandingResponse>> outstandingAcksByTarget =
             new ConcurrentHashMap<>();
     private ConfirmMode confirmMode = ConfirmMode.UNKNOWN;
-    @Nullable private ActorRef channelActor;
+    private final NatsConfig natsConfig;
 
     @SuppressWarnings("unused")
     private NatsPublisherActor(final Connection connection,
@@ -91,10 +80,9 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
                                final ConnectivityStatusResolver connectivityStatusResolver) {
         super(connection, clientId, connectivityStatusResolver);
         final Config config = getContext().getSystem().settings().config();
-        pendingAckTTL = DittoConnectivityConfig.of(DefaultScopedConfig.dittoScoped(config))
+        this.natsConfig = DittoConnectivityConfig.of(DefaultScopedConfig.dittoScoped(config))
                 .getConnectionConfig()
-                .getAmqp091Config()
-                .getPublisherPendingAckTTL();
+                .getNatsConfig();
     }
 
     /**
@@ -114,14 +102,7 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
 
     @Override
     protected void preEnhancement(final ReceiveBuilder receiveBuilder) {
-        receiveBuilder
-                .match(ChannelCreated.class, channelCreated -> {
-                    channelActor = channelCreated.channel();
-                    final ChannelMessage channelMessage = ChannelMessage.apply(this::onChannelCreated, false);
-                    channelCreated.channel().tell(channelMessage, getSelf());
-                })
-                .match(ChannelStatus.class, this::handleChannelStatus)
-                .build();
+        receiveBuilder.build();
     }
 
     @Override
@@ -131,7 +112,7 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
 
     @Override
     protected NatsTarget toPublishTarget(final GenericTarget target) {
-        return NatsTarget.fromTargetAddress(target.getAddress());
+        return NatsTarget.of(target.getAddress());
     }
 
     @Override
@@ -144,10 +125,6 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
 
         if (channelActor == null) {
             return sendFailedFuture(signal, "No channel available, dropping response.");
-        }
-
-        if (publishTarget.getRoutingKey() == null) {
-            return sendFailedFuture(signal, "No routing key, dropping message.");
         }
 
         final Map<String, String> messageHeaders = message.getHeaders();
@@ -182,10 +159,10 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
         final ChannelMessage channelMessage = ChannelMessage.apply(channel -> {
             try {
                 logger.withCorrelationId(message.getInternalHeaders())
-                        .debug("Publishing to exchange <{}> and routing key <{}>: {}", publishTarget.getExchange(),
+                        .debug("Publishing to exchange <{}> and routing key <{}>: {}", publishTarget.getSubject(),
                                 publishTarget.getRoutingKey(), basicProperties);
                 nextPublishSeqNoConsumer.accept(channel.getNextPublishSeqNo());
-                channel.basicPublish(publishTarget.getExchange(), publishTarget.getRoutingKey(), true, basicProperties,
+                channel.basicPublish(publishTarget.getSubject(), publishTarget.getRoutingKey(), true, basicProperties,
                         body);
             } catch (final Exception e) {
                 final String errorMessage = String.format("Failed to publish message to RabbitMQ: %s", e.getMessage());
@@ -256,16 +233,6 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
         resourceStatusMap.putAll(channelStatus.targetStatus);
     }
 
-    // called by ChannelActor; must be thread-safe.
-    private Void onChannelCreated(final Channel channel) {
-        final IOException confirmationStatus =
-                tryToEnterConfirmationMode(channel, outstandingAcks, outstandingAcksByTarget).orElse(null);
-        final Map<Target, ResourceStatus> targetStatus =
-                declareExchangesPassive(channel, NatsTarget::fromTargetAddress);
-        getSelf().tell(new ChannelStatus(confirmationStatus, targetStatus), ActorRef.noSender());
-        return null;
-    }
-
     private static SendResult buildResponseWithTimeout(final Signal<?> signal, @Nullable final Target autoAckTarget,
             final ExpressionResolver connectionIdResolver) {
         return buildResponse(signal, autoAckTarget, HttpStatus.REQUEST_TIMEOUT,
@@ -313,59 +280,6 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
         return new SendResult(issuedAck, signal.getDittoHeaders());
     }
 
-    private Map<Target, ResourceStatus> declareExchangesPassive(final Channel channel,
-            final Function<String, NatsTarget> toPublishTarget) {
-
-        final List<Target> targets = connection.getTargets();
-        final Map<String, Target> exchanges = targets.stream()
-                .collect(Collectors.toMap(
-                        t -> toPublishTarget.apply(t.getAddress()).getExchange(),
-                        Function.identity()));
-        final Map<Target, ResourceStatus> declarationStatus = new HashMap<>();
-        exchanges.forEach((exchange, target) -> {
-            logger.debug("Checking for existence of exchange <{}>.", exchange);
-            try {
-                channel.exchangeDeclarePassive(exchange);
-            } catch (final IOException e) {
-                logger.warning("Failed to declare exchange <{}> passively.", exchange);
-                if (target != null) {
-                    declarationStatus.put(target,
-                            ConnectivityModelFactory.newTargetStatus(InstanceIdentifierSupplier.getInstance().get(),
-                                    ConnectivityStatus.MISCONFIGURED,
-                                    target.getAddress(),
-                                    "Exchange '" + exchange + "' was missing at " + Instant.now()));
-                }
-            }
-        });
-        return Collections.unmodifiableMap(declarationStatus);
-    }
-
-    private static Optional<IOException> tryToEnterConfirmationMode(final Channel channel,
-            final ConcurrentSkipListMap<Long, OutstandingResponse> outstandingAcks,
-            final ConcurrentHashMap<NatsTarget, Queue<OutstandingResponse>> outstandingAcksByTarget) {
-
-        try {
-            enterConfirmationMode(channel, outstandingAcks, outstandingAcksByTarget);
-            return Optional.empty();
-        } catch (final IOException e) {
-            return Optional.of(e);
-        }
-    }
-
-    private static void enterConfirmationMode(final Channel channel,
-            final ConcurrentSkipListMap<Long, OutstandingResponse> outstandingAcks,
-            final ConcurrentHashMap<NatsTarget, Queue<OutstandingResponse>> outstandingAcksByTarget)
-            throws IOException {
-
-        channel.confirmSelect();
-        channel.clearConfirmListeners();
-        channel.clearReturnListeners();
-        final ActorConfirmListener confirmListener =
-                new ActorConfirmListener(outstandingAcks, outstandingAcksByTarget);
-        channel.addConfirmListener(confirmListener);
-        channel.addReturnListener(confirmListener);
-    }
-
     private static <T> CompletionStage<T> sendFailedFuture(final Signal<?> signal, final String errorMessage) {
         return CompletableFuture.failedFuture(sendFailed(signal, errorMessage, null));
     }
@@ -391,94 +305,6 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
         }
     }
 
-    private static final class ActorConfirmListener implements ConfirmListener, ReturnListener {
-
-        private final ConcurrentSkipListMap<Long, OutstandingResponse> outstandingAcks;
-        private final ConcurrentHashMap<NatsTarget, Queue<OutstandingResponse>> outstandingAcksByTarget;
-
-        private ActorConfirmListener(final ConcurrentSkipListMap<Long, OutstandingResponse> outstandingAcks,
-                final ConcurrentHashMap<NatsTarget, Queue<OutstandingResponse>> outstandingAcksByTarget) {
-            this.outstandingAcks = outstandingAcks;
-            this.outstandingAcksByTarget = outstandingAcksByTarget;
-        }
-
-        /**
-         * Handle ACK from the broker. ACK messages are always sent after a RETURN message.
-         * The channel actor runs this listener in its thread, which guarantees that this.handleAck is always
-         * called after this.handleReturn returns.
-         *
-         * @param deliveryTag The delivery tag of the acknowledged message.
-         * @param multiple Whether this acknowledgement applies to multiple messages.
-         */
-        @Override
-        public void handleAck(final long deliveryTag, final boolean multiple) {
-            forEach(deliveryTag, multiple, OutstandingResponse::completeWithSuccess);
-        }
-
-        /**
-         * Handle NACK from the broker. NACK messages are always handled after this.handleReturn returns.
-         *
-         * @param deliveryTag The delivery tag of the acknowledged message.
-         * @param multiple Whether this acknowledgement applies to multiple messages.
-         */
-        @Override
-        public void handleNack(final long deliveryTag, final boolean multiple) {
-            forEach(deliveryTag, multiple, OutstandingResponse::completeWithFailure);
-        }
-
-        /**
-         * Handle RETURN from the broker. RETURN messages are sent if a routing key does not exist for an existing
-         * exchange. Since users can set publish target for each message by the means of placeholders, and because
-         * queues can be created and deleted at any time, getting RETURN messages does not imply failure of the whole
-         * channel.
-         * <p>
-         * Here all outstanding acks of an exchange, routing-key pair are completed exceptionally with the reply text
-         * and reply code.
-         *
-         * @param replyCode reply code of this RETURN message.
-         * @param replyText textual description of this RETURN message.
-         * @param exchange exchange of the outgoing message being returned.
-         * @param routingKey routing key of the outgoing message being returned.
-         * @param properties AMQP properties of the RETURN message; typically empty regardless of the properties of the
-         * outgoing message being returned.
-         * @param body body of the returned message.
-         */
-        @Override
-        public void handleReturn(final int replyCode, final String replyText, final String exchange,
-                final String routingKey,
-                final AMQP.BasicProperties properties, final byte[] body) {
-
-            final NatsTarget rabbitMQTarget = NatsTarget.of(exchange, routingKey);
-            final Queue<OutstandingResponse> queue = outstandingAcksByTarget.get(rabbitMQTarget);
-            // cleanup handled in another thread on completion of each outstanding ack
-            if (queue != null) {
-                queue.forEach(outstandingAck -> outstandingAck.completeForReturn(replyCode, replyText));
-            }
-        }
-
-        private void forEach(final long deliveryTag, final boolean multiple,
-                final Consumer<OutstandingResponse> outstandingAckConsumer) {
-            if (multiple) {
-                // iterator is in key order because each ConcurrentSkipListMap is a SortedMap
-                final Iterator<Map.Entry<Long, OutstandingResponse>> it = outstandingAcks.entrySet().iterator();
-                while (it.hasNext()) {
-                    final Map.Entry<Long, OutstandingResponse> entry = it.next();
-                    if (entry.getKey() > deliveryTag) {
-                        break;
-                    }
-                    outstandingAckConsumer.accept(entry.getValue());
-                    it.remove();
-                }
-            } else {
-                final OutstandingResponse outstandingAck = outstandingAcks.get(deliveryTag);
-                if (outstandingAck != null) {
-                    outstandingAckConsumer.accept(outstandingAck);
-                    outstandingAcks.remove(deliveryTag);
-                }
-            }
-        }
-    }
-
     private static final class OutstandingResponse {
 
         private final Signal<?> signal;
@@ -494,34 +320,6 @@ public final class NatsPublisherActor extends BasePublisherActor<NatsTarget> {
             this.future = future;
             this.connectionIdResolver = connectionIdResolver;
         }
-
-        private void completeWithSuccess() {
-            future.complete(buildSuccessResponse(signal, autoAckTarget, connectionIdResolver));
-        }
-
-        private void completeWithFailure() {
-            future.complete(buildFailureResponse(signal, autoAckTarget));
-        }
-
-        private SendResult buildFailureResponse(final Signal<?> signal, @Nullable final Target target) {
-            return buildResponse(signal, target, HttpStatus.SERVICE_UNAVAILABLE,
-                    "Received negative confirm from the external broker.", connectionIdResolver);
-        }
-
-        private void completeForReturn(final int replyCode, final String replyText) {
-            future.complete(buildReturnResponse(signal, autoAckTarget, replyCode, replyText));
-        }
-
-        private SendResult buildReturnResponse(final Signal<?> signal,
-                @Nullable final Target autoAckTarget,
-                final int replyCode,
-                final String replyText) {
-
-            return buildResponse(signal, autoAckTarget, HttpStatus.SERVICE_UNAVAILABLE,
-                    String.format("Received basic.return from the external broker: %d %s", replyCode, replyText),
-                    connectionIdResolver);
-        }
-
     }
 
     private enum ConfirmMode {

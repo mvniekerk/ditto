@@ -15,36 +15,31 @@ package org.eclipse.ditto.connectivity.service.messaging.nats;
 import akka.actor.ActorRef;
 import akka.actor.Props;
 import akka.actor.Status;
-import akka.japi.pf.FI;
 import akka.japi.pf.FSMStateFunctionBuilder;
 import akka.pattern.Patterns;
-import com.rabbitmq.client.*;
+import com.typesafe.config.Config;
 import io.nats.client.Options;
 import org.eclipse.ditto.base.model.headers.DittoHeaders;
 import org.eclipse.ditto.connectivity.api.BaseClientState;
 import org.eclipse.ditto.connectivity.model.Connection;
-import org.eclipse.ditto.connectivity.model.ConnectivityModelFactory;
-import org.eclipse.ditto.connectivity.model.ConnectivityStatus;
 import org.eclipse.ditto.connectivity.model.Target;
-import org.eclipse.ditto.connectivity.model.signals.commands.exceptions.ConnectionFailedException;
 import org.eclipse.ditto.connectivity.model.signals.commands.modify.TestConnection;
 import org.eclipse.ditto.connectivity.service.config.ClientConfig;
+import org.eclipse.ditto.connectivity.service.config.DittoConnectivityConfig;
+import org.eclipse.ditto.connectivity.service.config.NatsConfig;
 import org.eclipse.ditto.connectivity.service.messaging.BaseClientActor;
 import org.eclipse.ditto.connectivity.service.messaging.BaseClientData;
 import org.eclipse.ditto.connectivity.service.messaging.internal.ClientConnected;
 import org.eclipse.ditto.connectivity.service.messaging.internal.ClientDisconnected;
-import org.eclipse.ditto.connectivity.service.messaging.internal.ConnectionFailure;
-import org.eclipse.ditto.connectivity.service.messaging.rabbitmq.RabbitConnectionFactoryFactory;
 import org.eclipse.ditto.connectivity.service.util.ConnectivityMdcEntryKey;
 import org.eclipse.ditto.internal.utils.akka.logging.ThreadSafeDittoLoggingAdapter;
-import org.eclipse.ditto.internal.utils.config.InstanceIdentifierSupplier;
+import org.eclipse.ditto.internal.utils.config.DefaultScopedConfig;
 import scala.Option;
 import scala.concurrent.duration.FiniteDuration;
 
 import javax.annotation.Nullable;
 import java.io.IOException;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -65,8 +60,10 @@ public final class NatsClientActor extends BaseClientActor {
     private final Map<String, String> consumedTagsToAddresses;
     private final Map<String, ActorRef> consumerByAddressWithIndex;
 
-    @Nullable private ActorRef natsConnectionActor;
+    private io.nats.client.Connection natsConnection;
     private ActorRef natsPublisherActor;
+
+    private NatsConfig natsConfig;
 
     /*
      * This constructor is called via reflection by the static method propsForTest.
@@ -83,7 +80,10 @@ public final class NatsClientActor extends BaseClientActor {
         consumedTagsToAddresses = new HashMap<>();
         consumerByAddressWithIndex = new HashMap<>();
 
-        natsConnectionActor = null;
+        final Config config = getContext().getSystem().settings().config();
+        this.natsConfig = DittoConnectivityConfig.of(DefaultScopedConfig.dittoScoped(config))
+                .getConnectionConfig()
+                .getNatsConfig();
     }
 
     /*
@@ -99,7 +99,10 @@ public final class NatsClientActor extends BaseClientActor {
         consumedTagsToAddresses = new HashMap<>();
         consumerByAddressWithIndex = new HashMap<>();
 
-        natsConnectionActor = null;
+        final Config config = getContext().getSystem().settings().config();
+        this.natsConfig = DittoConnectivityConfig.of(DefaultScopedConfig.dittoScoped(config))
+                .getConnectionConfig()
+                .getNatsConfig();
     }
 
     /**
@@ -125,24 +128,8 @@ public final class NatsClientActor extends BaseClientActor {
         return excludedChildNamePatterns;
     }
 
-    /**
-     * Creates Akka configuration object for this actor.
-     *
-     * @param connection the connection.
-     * @param proxyActor the actor used to send signals into the ditto cluster.
-     * @param connectionActor the connectionPersistenceActor which created this client.
-     * @param rabbitConnectionFactoryFactory the ConnectionFactory Factory to use.
-     * @return the Akka configuration Props object.
-     */
-    static Props propsForTests(final Connection connection, @Nullable final ActorRef proxyActor,
-            final ActorRef connectionActor, final RabbitConnectionFactoryFactory rabbitConnectionFactoryFactory) {
-
-        return Props.create(NatsClientActor.class, validateConnection(connection), proxyActor, connectionActor,
-                rabbitConnectionFactoryFactory, DittoHeaders.empty());
-    }
 
     private static Connection validateConnection(final Connection connection) {
-        // the target addresses must have the format exchange/routingKey for RabbitMQ
         connection.getTargets()
                 .stream()
                 .map(Target::getAddress)
@@ -217,8 +204,11 @@ public final class NatsClientActor extends BaseClientActor {
         logger.debug("cleaning up");
         stopCommandConsumers();
         stopChildActor(natsPublisherActor);
-        stopChildActor(natsConnectionActor);
-        natsConnectionActor = null;
+        try {
+            natsConnection.close();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
     }
 
     @Override
@@ -240,15 +230,6 @@ public final class NatsClientActor extends BaseClientActor {
         }
     }
 
-    private static Object messageFromConnectionStatus(final Status.Status status) {
-        if (status instanceof Status.Failure) {
-            final Status.Failure failure = (Status.Failure) status;
-            return ConnectionFailure.of(null, failure.cause(), null);
-        } else {
-            return (ClientConnected) Optional::empty;
-        }
-    }
-
     private CompletionStage<Status.Status> connect(final Connection connection,
             @Nullable final CharSequence correlationId,
             final Duration createChannelTimeout,
@@ -257,7 +238,7 @@ public final class NatsClientActor extends BaseClientActor {
         final ThreadSafeDittoLoggingAdapter l = logger.withCorrelationId(correlationId)
                 .withMdcEntry(ConnectivityMdcEntryKey.CONNECTION_ID, connection.getId());
         final CompletableFuture<Status.Status> future = new CompletableFuture<>();
-        if (natsConnectionActor == null) {
+        if (natsConnection == null) {
 
             final Optional<Options.Builder> connectionFactoryOpt =
                     tryToCreateConnectionFactory(natsConnectionBuilderFactory, connection);
@@ -268,7 +249,7 @@ public final class NatsClientActor extends BaseClientActor {
                 final Props props = com.newmotion.akka.rabbitmq.ConnectionActor.props(connectionFactory,
                         FiniteDuration.apply(internalReconnectTimeout.getSeconds(), TimeUnit.SECONDS),
                         (rmqConnection, connectionActorRef) -> {
-                            l.info("Established RMQ connection: {}", rmqConnection);
+                            l.info("Established Nats connection: {}", rmqConnection);
                             return null;
                         });
 
@@ -308,21 +289,6 @@ public final class NatsClientActor extends BaseClientActor {
 
     }
 
-    private void createConsumerChannelAndNotifySelf(final Status.Status status, final boolean consuming,
-            final ActorRef self, final Duration createChannelTimeout) {
-
-        if (consuming && status instanceof Status.Success && null != natsConnectionActor) {
-            // send self the created channel
-            final CreateChannel createChannel =
-                    CreateChannel.apply(ChannelActor.props(SendChannel.to(self)::apply),
-                            Option.apply(CONSUMER_CHANNEL));
-            // connection actor sends ChannelCreated; use an ASK to swallow the reply in which we are disinterested
-            Patterns.ask(natsConnectionActor, createChannel, createChannelTimeout);
-        } else {
-            final Object selfMessage = messageFromConnectionStatus(status);
-            self.tell(selfMessage, self);
-        }
-    }
 
     private ActorRef startNatsPublisherActor() {
         stopChildActor(natsPublisherActor);
@@ -342,14 +308,13 @@ public final class NatsClientActor extends BaseClientActor {
         consumerByAddressWithIndex.clear();
     }
 
-    private void startCommandConsumers(final Channel channel) {
+    private void startCommandConsumers(final String channel) {
         logger.info("Starting to consume queues...");
-        ensureQueuesExist(channel);
         stopCommandConsumers();
         startConsumers(channel);
     }
 
-    private void startConsumers(final Channel channel) {
+    private void startConsumers(final String channel) {
         getSourcesOrEmptyList().forEach(source ->
                 source.getAddresses().forEach(sourceAddress -> {
                     for (int i = 0; i < source.getConsumerCount(); i++) {
@@ -374,50 +339,15 @@ public final class NatsClientActor extends BaseClientActor {
         );
     }
 
-    private void ensureQueuesExist(final Channel channel) {
-        final Collection<String> missingQueues = new ArrayList<>();
-        getSourcesOrEmptyList().forEach(consumer ->
-                consumer.getAddresses().forEach(address -> {
-                    try {
-                        channel.queueDeclarePassive(address);
-                    } catch (final IOException e) {
-                        missingQueues.add(address);
-                        logger.warning("The queue <{}> does not exist.", address);
-                    } catch (final AlreadyClosedException e) {
-                        if (!missingQueues.isEmpty()) {
-                            // Our client will automatically close the connection if a queue does not exists. This will
-                            // cause an AlreadyClosedException for the following queue (e.g. ['existing1', 'notExisting', -->'existing2'])
-                            // That's why we will ignore this error if the missingQueues list isn't empty.
-                            logger.warning(
-                                    "Received exception of type {} when trying to declare queue {}. This happens when a previous " +
-                                            "queue was missing and thus the connection got closed.",
-                                    e.getClass().getName(), address);
-                        } else {
-                            logger.error(e, "Exception while declaring queue {}", address);
-                            throw e;
-                        }
-                    }
-                })
-        );
-        if (!missingQueues.isEmpty()) {
-            logger.warning("Stopping RMQ client actor for connection <{}> as queues to connect to are missing: <{}>",
-                    connectionId(), missingQueues);
-            connectionLogger.failure("Can not connect to RabbitMQ as queues are missing: {0}", missingQueues);
-            throw ConnectionFailedException.newBuilder(connectionId())
-                    .description("The queues " + missingQueues + " to connect to are missing.")
-                    .build();
-        }
-    }
-
     private static final class NatsConsumerChannelCreated implements ClientConnected {
 
-        private final Channel channel;
+        private final String channel;
 
-        private NatsConsumerChannelCreated(final Channel channel) {
+        private NatsConsumerChannelCreated(final String channel) {
             this.channel = channel;
         }
 
-        private Channel getChannel() {
+        private String getChannel() {
             return channel;
         }
 
@@ -427,119 +357,4 @@ public final class NatsClientActor extends BaseClientActor {
         }
 
     }
-
-    private static final class SendChannel implements FI.Apply2<Channel, ActorRef, Object> {
-
-        private final ActorRef recipient;
-
-        private SendChannel(final ActorRef recipient) {
-            this.recipient = recipient;
-        }
-
-        private static SendChannel to(final ActorRef recipient) {
-            return new SendChannel(recipient);
-        }
-
-        @Override
-        public Object apply(final Channel channel, final ActorRef channelActor) {
-            recipient.tell(new NatsConsumerChannelCreated(channel), channelActor);
-            return channel;
-        }
-
-    }
-
-    /**
-     * Custom consumer which is notified about different events related to the connection in order to track connectivity
-     * status.
-     */
-    private final class NatsMessageConsumer extends DefaultConsumer {
-
-        private final ActorRef consumerActor;
-        private final String address;
-
-        /**
-         * Constructs a new instance and records its association to the passed-in channel.
-         *
-         * @param consumerActor the ActorRef to the consumer actor
-         * @param channel the channel to which this consumer is attached
-         * @param address the address of the consumer
-         */
-        private NatsMessageConsumer(final ActorRef consumerActor,
-                                    final Channel channel, final String address) {
-            super(channel);
-            this.consumerActor = consumerActor;
-            this.address = address;
-            updateSourceStatus(ConnectivityStatus.OPEN, "Consumer initialized at " + Instant.now());
-        }
-
-        @Override
-        public void handleDelivery(final String consumerTag, final Envelope envelope,
-                final AMQP.BasicProperties properties, final byte[] body) {
-
-            consumerActor.tell(new Delivery(envelope, properties, body), getSelf());
-        }
-
-        @Override
-        public void handleConsumeOk(final String consumerTag) {
-            super.handleConsumeOk(consumerTag);
-
-            final String consumingQueueByTag = consumedTagsToAddresses.get(consumerTag);
-            if (null != consumingQueueByTag) {
-                connectionLogger.success("Consume OK for consumer queue {0}", consumingQueueByTag);
-                logger.info("Consume OK for consumer queue <{}> on connection <{}>.", consumingQueueByTag,
-                        connectionId());
-            }
-
-            updateSourceStatus(ConnectivityStatus.OPEN, "Consumer started at " + Instant.now());
-        }
-
-        @Override
-        public void handleCancel(final String consumerTag) throws IOException {
-            super.handleCancel(consumerTag);
-
-            final String consumingQueueByTag = consumedTagsToAddresses.get(consumerTag);
-            if (null != consumingQueueByTag) {
-                connectionLogger.failure("Consumer with queue {0} was cancelled. This can happen for example " +
-                        "when the queue was deleted.", consumingQueueByTag);
-                logger.info("Consumer with queue <{}> was cancelled on connection <{}>. This can happen for " +
-                        "example when the queue was deleted.", consumingQueueByTag, connectionId());
-            }
-
-            updateSourceStatus(ConnectivityStatus.MISCONFIGURED, "Consumer for queue cancelled at " + Instant.now());
-        }
-
-        @Override
-        public void handleShutdownSignal(final String consumerTag, final ShutdownSignalException sig) {
-            super.handleShutdownSignal(consumerTag, sig);
-
-            final String consumingQueueByTag = consumedTagsToAddresses.get(consumerTag);
-            if (null != consumingQueueByTag) {
-                connectionLogger.failure(
-                        "Consumer with queue <{0}> shutdown as the channel or the underlying connection has " +
-                                "been shut down.", consumingQueueByTag);
-                logger.warning("Consumer with queue <{}> shutdown as the channel or the underlying connection has " +
-                        "been shut down on connection <{}>.", consumingQueueByTag, connectionId());
-            }
-
-            final ConnectivityStatus failureStatus = connectivityStatusResolver.resolve(sig);
-            updateSourceStatus(failureStatus,
-                    "Channel or the underlying connection has been shut down at " + Instant.now());
-        }
-
-        @Override
-        public void handleRecoverOk(final String consumerTag) {
-            super.handleRecoverOk(consumerTag);
-
-            logger.info("Recovered OK for consumer with tag <{}> on connection <{}>", consumerTag, connectionId());
-
-            getSelf().tell((ClientConnected) Optional::empty, getSelf());
-        }
-
-        private void updateSourceStatus(final ConnectivityStatus connectionStatus, final String statusDetails) {
-            consumerActor.tell(ConnectivityModelFactory.newStatusUpdate(InstanceIdentifierSupplier.getInstance().get(),
-                    connectionStatus, address, statusDetails, Instant.now()), ActorRef.noSender());
-        }
-
-    }
-
 }

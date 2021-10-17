@@ -15,6 +15,7 @@ package org.eclipse.ditto.connectivity.service.config;
 import org.eclipse.ditto.internal.utils.config.KnownConfigValue;
 
 import javax.annotation.concurrent.Immutable;
+import java.time.Duration;
 import java.util.List;
 import static io.nats.client.Options.*;
 
@@ -24,7 +25,32 @@ import static io.nats.client.Options.*;
 @Immutable
 public interface NatsConfig {
 
-    List<String> servers();
+    List<String> getServers();
+    boolean isNoRandomize();
+    String getConnectionName();
+    boolean isVerbose();
+    boolean isPedantic();
+    int getMaxControlLine();
+    int getMaxReconnect();
+    Duration getReconnectWait();
+    Duration getReconnectJitter();
+    Duration getReconnectJitterTls();
+    Duration getConnectionTimeout();
+    Duration getPingInterval();
+    Duration getRequestCleanupInterval();
+    int getMaxPingsOut();
+    int getReconnectBufferSize();
+    boolean isUseOldRequestStyle();
+    int getBufferSize();
+    boolean isTraceAdvancedStats();
+    boolean isTraceConnection();
+    boolean isNoEcho();
+    boolean isNoHeaders();
+    boolean isNoNoResponders();
+    boolean isUtf8Response();
+    String getInboxPrefix();
+    int getMaxMessagesInOutgoingQueue();
+    boolean isDiscardMessagesWhenOutgoingQueueFull();
 
     /**
      * An enumeration of the known config path expressions and their associated default values for
