@@ -38,6 +38,11 @@ public enum ConnectionType implements CharSequence {
     MQTT("mqtt"),
 
     /**
+     * Indicates a NATS connection
+     */
+    NATS("nats"),
+
+    /**
      * Indicates a Kafka connection.
      */
     KAFKA("kafka"),

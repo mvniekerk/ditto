@@ -126,6 +126,10 @@
             <groupId>org.mozilla</groupId>
             <artifactId>rhino-runtime</artifactId>
         </dependency>
+        <dependency>
+            <groupId>io.nats</groupId>
+            <artifactId>jnats</artifactId>
+        </dependency>
 
         <!-- note: the order of classindex and jmh-generator-annprocess is important (classindex before
 jmh-generator-annprocess). jmh-generator-annprocess overwrites the whole META-INF folder otherwise -->
